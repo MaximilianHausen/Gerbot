@@ -1,0 +1,18 @@
+[package]
+name = "gerbot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serenity = "0.12"
+poise = "0.6.1"
+songbird = "0.4.3"
+
+tokio = { version = "1.39.1", features = ["macros", "rt-multi-thread"] }
+env_logger = "0.11.5"
+log = "0.4.22"
+
+# Only for registering the HttpClient for songbird
+reqwest = { version = "*", default-features = false }
+# Only for enabling codec support in songbird
+symphonia = { version = "*", features = ["aac", "mp3", "isomp4", "alac", "flac"]}

@@ -1,0 +1,7 @@
+{
+    "name": "Gerbot",
+    "image": "rust:1.80",
+    "features": {
+        "ghcr.io/devcontainers-contrib/features/yt-dlp:2": {}
+    }
+}
