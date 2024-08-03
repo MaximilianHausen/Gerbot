@@ -10,12 +10,13 @@ use serenity::model::Colour;
 use songbird::{Call, Songbird};
 use songbird::error::JoinError;
 use songbird::input::YoutubeDl;
+use songbird::tracks::LoopState;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::{CommandContext, Error};
 
-const RESPONSE_COLOUR: Colour = Colour::BLURPLE;
+const SUCCESS_COLOUR: Colour = Colour::BLURPLE;
 const ERROR_COLOUR: Colour = Colour::RED;
 
 // ======== Util functions ========
@@ -39,6 +40,23 @@ fn get_author_voice_state(ctx: CommandContext<'_>) -> (GuildId, Option<ChannelId
 
 fn map_err<T>(send_result: Result<T, serenity::Error>) -> Result<T, Error> {
     send_result.map_err(|e| Box::new(e) as Error)
+}
+
+async fn respond_success<'a>(
+    ctx: &'a CommandContext<'a>,
+    title: impl Into<String>,
+    details: impl Into<String>,
+    ephemeral: bool,
+) -> Result<ReplyHandle<'a>, Error> {
+    let embed = CreateEmbed::new()
+        .title(title)
+        .colour(SUCCESS_COLOUR)
+        .field("Details", details, false);
+
+    map_err(
+        ctx.send(CreateReply::default().embed(embed).ephemeral(ephemeral))
+            .await,
+    )
 }
 
 async fn respond_err<'a>(
@@ -68,7 +86,7 @@ enum JoinVoiceError {
 
 /// Makes the bot join a specific voice channel, if it is not already in a different one
 async fn join_voice(
-    songbird: impl Deref<Target = Songbird>,
+    songbird: impl Deref<Target=Songbird>,
     guild_id: GuildId,
     channel_id: ChannelId,
 ) -> Result<Arc<Mutex<Call>>, JoinVoiceError> {
@@ -90,6 +108,20 @@ async fn join_voice(
     Ok(songbird.join(guild_id, channel_id).await?)
 }
 
+/// Checks if the command author is in a voice call with the bot
+async fn check_user_in_call(ctx: CommandContext<'_>) -> bool {
+    let (user_guild, user_channel) = get_author_voice_state(ctx);
+    let songbird = songbird::get(ctx.serenity_context()).await.unwrap();
+
+    if let (Some(user_channel), Some(call)) = (user_channel, songbird.get(user_guild)) {
+        let bot_channel = call.lock().await.current_channel();
+
+        return bot_channel.is_some_and(|c| c == user_channel.into());
+    }
+
+    false
+}
+
 // ======== Commands ========
 
 /// Infos about the available commands
@@ -109,7 +141,7 @@ pub async fn help(ctx: CommandContext<'_>) -> Result<(), Error> {
 
     let embed = CreateEmbed::new()
         .title("Help")
-        .colour(RESPONSE_COLOUR)
+        .colour(SUCCESS_COLOUR)
         .fields(listed_commands.map(|c| {
             (
                 format!("`/{}`", c.name),
@@ -162,8 +194,8 @@ pub async fn play(
     ctx: CommandContext<'_>,
     #[description = "Youtube search or direct link to all platforms supported by yt-dlp"]
     #[description_localized(
-        "de",
-        "Youtube-Suche oder Direktlink zu allen von yt-dlp unterstützten Platformen"
+    "de",
+    "Youtube-Suche oder Direktlink zu allen von yt-dlp unterstützten Platformen"
     )]
     #[autocomplete = "autocomplete_yt_search"]
     source: String,
@@ -180,10 +212,10 @@ pub async fn play(
     // ======== Join the right voice channel or return ========
 
     // Get user's current voice channel
-    let (guild_id, channel_id) = get_author_voice_state(ctx);
+    let (user_guild, user_channel) = get_author_voice_state(ctx);
 
     // Return if user not in a voice channel
-    let connect_to = match channel_id {
+    let connect_to = match user_channel {
         Some(channel) => channel,
         None => {
             _ = respond_err(&ctx, "Du bist nicht in einem Sprachkanal in diesem Server").await?;
@@ -194,7 +226,7 @@ pub async fn play(
     let songbird = songbird::get(ctx.serenity_context()).await.unwrap();
 
     // Make sure the bot is in the right channel
-    let call = match join_voice(songbird, guild_id, connect_to).await {
+    let call = match join_voice(songbird, user_guild, connect_to).await {
         Ok(c) => c,
         Err(JoinVoiceError::Join(e)) => {
             _ = respond_err(&ctx, "Der Bot konnte deinem Sprachkanal nicht beitreten").await?;
@@ -204,8 +236,7 @@ pub async fn play(
             _ = respond_err(
                 &ctx,
                 "Der Bot wird bereits in einem anderen Sprachkanal verwendet",
-            )
-            .await?;
+            ).await?;
             return Ok(());
         }
     };
@@ -231,18 +262,70 @@ pub async fn play(
         let _track_handle = call.enqueue_input(src.into()).await;
     }
 
-    let embed = CreateEmbed::new()
-        .title("Track Found")
-        .colour(RESPONSE_COLOUR)
-        .field(
-            "Details",
-            format!(
-                "Ein Lied wird jetzt in {} abgespielt",
-                ctx.guild().unwrap().channels.get(&connect_to).unwrap().name
-            ),
-            false,
-        );
-    _ = map_err(ctx.send(CreateReply::default().embed(embed)).await)?;
+    _ = respond_success(
+        &ctx,
+        "Track Found",
+        format!("Ein Lied wird jetzt in {} abgespielt", ctx.guild().unwrap().channels.get(&connect_to).unwrap().name),
+        false)
+        .await?;
+
+    Ok(())
+}
+
+/// Skips the currently playing track
+#[poise::command(
+    slash_command,
+    guild_only,
+    description_localized("de", "Überspringt das aktuelle Lied")
+)]
+pub async fn skip(ctx: CommandContext<'_>) -> Result<(), Error> {
+    if !check_user_in_call(ctx).await {
+        _ = respond_err(&ctx, "Du bist nicht in einem Sprachkanal mit dem Bot").await?;
+        return Ok(());
+    }
+
+    let songbird = songbird::get(ctx.serenity_context()).await.unwrap();
+    let user_guild = ctx.guild().unwrap().id;
+
+    if let Some(call) = songbird.get(user_guild) {
+        let call = call.lock().await;
+        _ = call.queue().skip();
+        _ = respond_success(&ctx, "Loop", "Lied übersprungen", false).await?;
+    }
+
+    Ok(())
+}
+
+/// Loops the current track until loop is deactivated again, or the track is skipped
+#[poise::command(
+    rename = "loop",
+    slash_command,
+    guild_only,
+    description_localized("de", "Wiederholt das aktuelle Lied bis loop wieder deaktiviert oder es übersprungen wird"
+    )
+)]
+pub async fn loop_command(ctx: CommandContext<'_>) -> Result<(), Error> {
+    if !check_user_in_call(ctx).await {
+        _ = respond_err(&ctx, "Du bist nicht in einem Sprachkanal mit dem Bot").await?;
+        return Ok(());
+    }
+
+    let songbird = songbird::get(ctx.serenity_context()).await.unwrap();
+    let user_guild = ctx.guild().unwrap().id;
+
+    if let Some(call) = songbird.get(user_guild) {
+        let call = call.lock().await;
+        let current_track = call.queue().current();
+        if let Some(current_track) = current_track {
+            if current_track.get_info().await.unwrap().loops == LoopState::Finite(0) {
+                _ = current_track.enable_loop();
+                _ = respond_success(&ctx, "Loop", "Wiederholung aktiviert", false).await?;
+            } else {
+                _ = current_track.disable_loop();
+                _ = respond_success(&ctx, "Loop", "Wiederholung deaktiviert", false).await?;
+            }
+        }
+    }
 
     Ok(())
 }

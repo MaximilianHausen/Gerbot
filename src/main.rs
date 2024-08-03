@@ -110,7 +110,10 @@ async fn main() {
 
     // Create framework configuration
     let options = poise::FrameworkOptions {
-        commands: vec![music_commands::help(), music_commands::play()],
+        commands: vec![music_commands::help(),
+                       music_commands::play(),
+                       music_commands::skip(),
+                       music_commands::loop_command()],
         on_error: |error| Box::pin(on_poise_error(error)),
         // This code is run before every command
         pre_command: |ctx| {
