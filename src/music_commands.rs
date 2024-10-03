@@ -1,23 +1,24 @@
-use std::ops::Deref;
-use std::sync::Arc;
-
 use log::error;
 use poise::{CreateReply, ReplyHandle};
 use reqwest::Client as HttpClient;
 use serenity::all::{ChannelId, GuildId};
-use serenity::builder::{AutocompleteChoice, CreateEmbed};
-use serenity::model::Colour;
-use songbird::{Call, Songbird};
+use serenity::builder::{AutocompleteChoice, CreateAllowedMentions, CreateEmbed};
+use serenity::futures::future::join_all;
+use serenity::prelude::Mentionable;
 use songbird::error::JoinError;
-use songbird::input::YoutubeDl;
-use songbird::tracks::LoopState;
+use songbird::input::{Compose, YoutubeDl};
+use songbird::tracks::{LoopState, TrackHandle};
+use songbird::{Call, Songbird};
+use std::ops::Deref;
+use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::{CommandContext, Error};
-
-const SUCCESS_COLOUR: Colour = Colour::BLURPLE;
-const ERROR_COLOUR: Colour = Colour::RED;
+use crate::metadata::{TrackMetadata, TrackMetadataKey};
+use crate::music_commands::GetCallError::{NotInCall, NotInGuild, SongbirdNotFound};
+use crate::CommandError::{LeaveVoice, QueueEmpty, UserNotInVoice};
+use crate::{yt_api, CommandContext, CommandError, SUCCESS_COLOUR};
 
 // ======== Util functions ========
 
@@ -25,11 +26,11 @@ async fn get_http_client(ctx: &serenity::client::Context) -> HttpClient {
     let data = ctx.data.read().await;
     data.get::<crate::HttpKey>()
         .cloned()
-        .expect("Guaranteed to exist in the typemap.")
+        .expect("Guaranteed to exist in the typemap")
 }
 
 fn get_author_voice_state(ctx: CommandContext<'_>) -> (GuildId, Option<ChannelId>) {
-    let guild = ctx.guild().unwrap();
+    let guild = ctx.guild().expect("Guild not in cache");
     let channel_id = guild
         .voice_states
         .get(&ctx.author().id)
@@ -38,46 +39,40 @@ fn get_author_voice_state(ctx: CommandContext<'_>) -> (GuildId, Option<ChannelId
     (guild.id, channel_id)
 }
 
-fn map_err<T>(send_result: Result<T, serenity::Error>) -> Result<T, Error> {
-    send_result.map_err(|e| Box::new(e) as Error)
+async fn get_metadata(track: &TrackHandle) -> Arc<TrackMetadata> {
+    track
+        .typemap()
+        .read()
+        .await
+        .get::<TrackMetadataKey>()
+        .expect("Every track is added with Metadata in the typemap")
+        .clone()
 }
+
+// ======== Shared components ========
 
 async fn respond_success<'a>(
     ctx: &'a CommandContext<'a>,
     title: impl Into<String>,
     details: impl Into<String>,
     ephemeral: bool,
-) -> Result<ReplyHandle<'a>, Error> {
+) -> Result<ReplyHandle<'a>, serenity::Error> {
     let embed = CreateEmbed::new()
         .title(title)
         .colour(SUCCESS_COLOUR)
         .field("Details", details, false);
 
-    map_err(
-        ctx.send(CreateReply::default().embed(embed).ephemeral(ephemeral))
-            .await,
+    ctx.send(
+        CreateReply::default()
+            .embed(embed)
+            .ephemeral(ephemeral)
+            .allowed_mentions(CreateAllowedMentions::new().empty_users()),
     )
+    .await
 }
-
-async fn respond_err<'a>(
-    ctx: &'a CommandContext<'a>,
-    details: impl Into<String>,
-) -> Result<ReplyHandle<'a>, Error> {
-    let embed = CreateEmbed::new()
-        .title("Fehler")
-        .colour(ERROR_COLOUR)
-        .field("Details", details, false);
-
-    map_err(
-        ctx.send(CreateReply::default().embed(embed).ephemeral(true))
-            .await,
-    )
-}
-
-// ======== Shared components ========
 
 #[derive(Error, Debug)]
-enum JoinVoiceError {
+pub enum JoinVoiceError {
     #[error("Failed to join")]
     Join(#[from] JoinError),
     #[error("Did not join because the bot is used in another channel")]
@@ -86,7 +81,7 @@ enum JoinVoiceError {
 
 /// Makes the bot join a specific voice channel, if it is not already in a different one
 async fn join_voice(
-    songbird: impl Deref<Target=Songbird>,
+    songbird: impl Deref<Target = Songbird>,
     guild_id: GuildId,
     channel_id: ChannelId,
 ) -> Result<Arc<Mutex<Call>>, JoinVoiceError> {
@@ -108,18 +103,31 @@ async fn join_voice(
     Ok(songbird.join(guild_id, channel_id).await?)
 }
 
-/// Checks if the command author is in a voice call with the bot
-async fn check_user_in_call(ctx: CommandContext<'_>) -> bool {
-    let (user_guild, user_channel) = get_author_voice_state(ctx);
-    let songbird = songbird::get(ctx.serenity_context()).await.unwrap();
+#[derive(Error, Debug)]
+pub enum GetCallError {
+    #[error("The command was not called from a guild (this should never happen)")]
+    NotInGuild,
+    #[error("Songbird instance could not be retrieved from the command context")]
+    SongbirdNotFound,
+    #[error("The author is not in a voice channel with the bot")]
+    NotInCall,
+}
 
-    if let (Some(user_channel), Some(call)) = (user_channel, songbird.get(user_guild)) {
-        let bot_channel = call.lock().await.current_channel();
+/// Shared boilerplate for getting the active call for a command and correctly mapping all the error cases
+async fn get_call(ctx: CommandContext<'_>) -> Result<(ChannelId, Arc<Mutex<Call>>), GetCallError> {
+    let guild_id = ctx.guild_id().ok_or(NotInGuild)?;
+    let songbird = songbird::get(ctx.serenity_context())
+        .await
+        .ok_or(SongbirdNotFound)?;
+    let call = songbird.get(guild_id).ok_or(NotInCall)?;
+    let bot_channel = call.lock().await.current_channel().ok_or(NotInCall)?;
+    let user_channel = get_author_voice_state(ctx).1.ok_or(NotInCall)?;
 
-        return bot_channel.is_some_and(|c| c == user_channel.into());
+    if bot_channel != user_channel.into() {
+        return Err(NotInCall);
     }
 
-    false
+    Ok((user_channel, call))
 }
 
 // ======== Commands ========
@@ -128,10 +136,9 @@ async fn check_user_in_call(ctx: CommandContext<'_>) -> bool {
 #[poise::command(
     slash_command,
     guild_only,
-    ephemeral,
     description_localized("de", "Infos zu den verfügbaren Commands")
 )]
-pub async fn help(ctx: CommandContext<'_>) -> Result<(), Error> {
+pub async fn help(ctx: CommandContext<'_>) -> Result<(), CommandError> {
     let listed_commands = ctx
         .framework()
         .options
@@ -146,16 +153,16 @@ pub async fn help(ctx: CommandContext<'_>) -> Result<(), Error> {
             (
                 format!("`/{}`", c.name),
                 ctx.locale()
-                    .map(|l| c.description_localizations.get(l).map(|l| l.as_str()))
-                    .flatten()
+                    .and_then(|l| c.description_localizations.get(l).map(|l| l.as_str()))
                     .unwrap_or(c.description.as_deref().unwrap_or_default()),
                 false,
             )
         }));
-    /*.field("`Weitere Infos`", "Die Warteschlange wird auch gelöscht, wenn der Bot manuell aus einem Sprachkanal entfernt wird oder den Sprachkanal wechselt\nAltersbeschränkte Videos können nicht abgespielt werden und werden automatisch übersprungen", false)
-    .field("`Schnellstart`", "1. Geh in den Sprachkanal, in dem du etwas abspielen willst\n2. Spiele etwas mit /play ab", false);*/
+    //.field("`Weitere Infos`", "Die Warteschlange wird auch gelöscht, wenn der Bot manuell aus einem Sprachkanal entfernt wird oder den Sprachkanal wechselt", false)
 
-    _ = map_err(ctx.send(CreateReply::default().embed(embed)).await)?;
+    _ = ctx
+        .send(CreateReply::default().embed(embed).ephemeral(true))
+        .await?;
 
     Ok(())
 }
@@ -163,13 +170,16 @@ pub async fn help(ctx: CommandContext<'_>) -> Result<(), Error> {
 async fn autocomplete_yt_search(ctx: CommandContext<'_>, partial: &str) -> Vec<AutocompleteChoice> {
     if partial.len() < 3 || partial.starts_with("http") {
         // Discord doesn't like 0-length options
-        return vec![AutocompleteChoice::new("Tippe weiter, um Suchvorschläge zu erhalten", partial)];
+        return vec![AutocompleteChoice::new(
+            "Tippe weiter, um Suchvorschläge zu erhalten",
+            partial,
+        )];
     }
 
     let http_client = get_http_client(ctx.serenity_context()).await;
     let yt_api_key = &ctx.data().yt_api_key;
 
-    match crate::yt_search::yt_search(partial, 5, http_client, yt_api_key.as_deref()).await {
+    match yt_api::yt_search(partial, 5, http_client, yt_api_key.as_deref()).await {
         Ok(results) => results
             .into_iter()
             .map(|video| AutocompleteChoice::new(&video.title, video.get_yt_url().as_str()))
@@ -188,58 +198,36 @@ async fn autocomplete_yt_search(ctx: CommandContext<'_>, partial: &str) -> Vec<A
 #[poise::command(
     slash_command,
     guild_only,
-    description_localized("de", "Spielt ein Lied im momentanen Sprachkanal ab")
+    description_localized("de", "Spielt ein Lied im momentanen Sprachkanal ab"),
+    required_bot_permissions = "VIEW_CHANNEL | CONNECT | SPEAK"
 )]
 pub async fn play(
     ctx: CommandContext<'_>,
     #[description = "Youtube search or direct link to all platforms supported by yt-dlp"]
     #[description_localized(
-    "de",
-    "Youtube-Suche oder Direktlink zu allen von yt-dlp unterstützten Platformen"
+        "de",
+        "Youtube-Suche oder Direktlink zu allen von yt-dlp unterstützten Platformen"
     )]
     #[autocomplete = "autocomplete_yt_search"]
     source: String,
     #[description = "If the queue should be skipped"]
     #[description_localized("de", "Ob die Warteschlange übersprungen werden soll")]
     skip_queue: Option<bool>,
-) -> Result<(), Error> {
-    //TODO: Implement SkipQueue
-    if skip_queue.is_some_and(|v| v) {
-        _ = respond_err(&ctx, "SkipQueue ist momentan nicht verfügbar").await?;
-        return Ok(());
-    }
-
+) -> Result<(), CommandError> {
     // ======== Join the right voice channel or return ========
 
     // Get user's current voice channel
     let (user_guild, user_channel) = get_author_voice_state(ctx);
 
     // Return if user not in a voice channel
-    let connect_to = match user_channel {
-        Some(channel) => channel,
-        None => {
-            _ = respond_err(&ctx, "Du bist nicht in einem Sprachkanal in diesem Server").await?;
-            return Ok(());
-        }
-    };
+    let connect_to = user_channel.ok_or(UserNotInVoice)?;
 
-    let songbird = songbird::get(ctx.serenity_context()).await.unwrap();
+    let songbird = songbird::get(ctx.serenity_context())
+        .await
+        .ok_or(SongbirdNotFound)?;
 
     // Make sure the bot is in the right channel
-    let call = match join_voice(songbird, user_guild, connect_to).await {
-        Ok(c) => c,
-        Err(JoinVoiceError::Join(e)) => {
-            _ = respond_err(&ctx, "Der Bot konnte deinem Sprachkanal nicht beitreten").await?;
-            return Err(e.into());
-        }
-        Err(JoinVoiceError::Occupied) => {
-            _ = respond_err(
-                &ctx,
-                "Der Bot wird bereits in einem anderen Sprachkanal verwendet",
-            ).await?;
-            return Ok(());
-        }
-    };
+    let call = join_voice(songbird, user_guild, connect_to).await?;
 
     // ======== Play song ========
 
@@ -247,27 +235,191 @@ pub async fn play(
     let do_search = !source.starts_with("http");
 
     // yt-dlp lookup
-    let src = if do_search {
+    let mut src = if do_search {
         // This only available as a fallback for when autocomplete fails completely
         YoutubeDl::new_search(http_client, source)
     } else {
         YoutubeDl::new(http_client, source)
     };
 
-    map_err(ctx.defer().await)?;
+    ctx.defer().await?;
 
     // Play track
-    {
-        let mut call = call.lock().await;
-        let _track_handle = call.enqueue_input(src.into()).await;
+    let mut call = call.lock().await;
+
+    //TODO: Get aux_metadata from id after enqueuing (Lower latency)
+    let metadata: Arc<TrackMetadata> = Arc::new(TrackMetadata::from_with_request(
+        src.aux_metadata().await.unwrap(),
+        ctx.author().id,
+    ));
+    let track_handle = call.enqueue_input(src.into()).await;
+
+    track_handle
+        .typemap()
+        .write()
+        .await
+        .insert::<TrackMetadataKey>(metadata.clone());
+
+    // skip_queue -> Move to the front and skip current track
+    if skip_queue.is_some_and(|v| v) {
+        let queue = call.queue();
+
+        if queue.len() > 1 {
+            queue.modify_queue(|raw_queue| {
+                let new = raw_queue.pop_back().unwrap();
+                raw_queue.insert(1, new);
+                raw_queue.front().unwrap().stop().unwrap();
+            });
+        }
+
+        _ = respond_success(
+            &ctx,
+            "Track Found",
+            format!(
+                "`{}` wird jetzt in {} abgespielt",
+                metadata.title,
+                connect_to.to_channel(ctx).await?.mention()
+            ),
+            false,
+        )
+        .await?;
+    } else {
+        _ = respond_success(
+            &ctx,
+            "Track Found",
+            format!(
+                "`{}` zur Wartschlange für {} hinzugefügt",
+                metadata.title,
+                connect_to.to_channel(ctx).await?.mention()
+            ),
+            false,
+        )
+        .await?;
     }
 
-    _ = respond_success(
-        &ctx,
-        "Track Found",
-        format!("Ein Lied wird jetzt in {} abgespielt", ctx.guild().unwrap().channels.get(&connect_to).unwrap().name),
-        false)
-        .await?;
+    Ok(())
+}
+
+/// Shows information about the currently playing track
+#[poise::command(
+    slash_command,
+    guild_only,
+    description_localized("de", "Zeigt informationen über den aktuellen Track")
+)]
+pub async fn now_playing(ctx: CommandContext<'_>) -> Result<(), CommandError> {
+    let (_channel_id, call) = get_call(ctx).await?;
+    let call = call.lock().await;
+
+    let queue = call.queue();
+    let track = queue.current().ok_or(QueueEmpty)?;
+    let metadata = get_metadata(&track).await;
+    let playback_info = track.get_info().await.unwrap();
+
+    fn format_duration(duration: Duration) -> String {
+        let mut secs = duration.as_secs();
+        let hours = secs / 3600;
+        secs -= hours * 3600;
+        let mins = secs / 60;
+        secs -= mins * 60;
+
+        let hours_str = if hours != 0 {
+            format!("{:02}:", hours)
+        } else {
+            "".to_owned()
+        };
+        format!("{}{:02}:{:02}", hours_str, mins, secs)
+    }
+
+    let response_details = format!(
+        "`Titel`: {}\n`Autor`: {}\n`Quelle`: {}\n`Angefordert von`: {}\n`Position`: {}/{}\n`Loop`: {}",
+        metadata.title,
+        metadata.author,
+        metadata.source_url,
+        metadata.requested_by.expect("Request data always present").mention(),
+        format_duration(playback_info.position),
+        format_duration(metadata.duration),
+        if playback_info.loops != LoopState::Finite(0) {
+            "aktiviert".to_owned()
+        } else {
+            "deaktiviert".to_owned()
+        }
+    );
+
+    _ = respond_success(&ctx, "Now playing", response_details, true).await?;
+
+    Ok(())
+}
+
+/// Shows the current queue
+#[poise::command(
+    slash_command,
+    guild_only,
+    description_localized("de", "Zeigt die aktuelle Wartschlange")
+)]
+pub async fn queue(ctx: CommandContext<'_>) -> Result<(), CommandError> {
+    let (_, call) = get_call(ctx).await?;
+    let call = call.lock().await;
+
+    let queue = call.queue();
+    if queue.is_empty() {
+        _ = respond_success(&ctx, "Queue", "Die Warteschlange ist leer", true).await?;
+        return Ok(());
+    };
+
+    let track_list = join_all(queue.current_queue().into_iter().enumerate().map(
+        |(i, t)| async move {
+            let meta = get_metadata(&t).await;
+            let icon = if t.get_info().await.unwrap().loops != LoopState::Finite(0) {
+                ":repeat:"
+            } else {
+                ""
+            };
+            format!("`{}` {icon} [{}]({})", i + 1, meta.title, meta.source_url)
+        },
+    ))
+    .await
+    .join("\n");
+
+    _ = respond_success(&ctx, "Queue", track_list, true).await?;
+
+    Ok(())
+}
+
+/// Loops the current track until loop is deactivated again, or the track is skipped
+#[poise::command(
+    rename = "loop",
+    slash_command,
+    guild_only,
+    description_localized(
+        "de",
+        "Wiederholt das aktuelle Lied bis loop wieder deaktiviert oder es übersprungen wird"
+    )
+)]
+pub async fn loop_command(ctx: CommandContext<'_>) -> Result<(), CommandError> {
+    let (channel_id, call) = get_call(ctx).await?;
+
+    let current_track = call.lock().await.queue().current().ok_or(QueueEmpty)?;
+
+    let was_looping = current_track.get_info().await.unwrap().loops != LoopState::Finite(0);
+
+    if was_looping {
+        _ = current_track.disable_loop()
+    } else {
+        _ = current_track.enable_loop()
+    }
+
+    let response_details = format!(
+        "Wiederholung für `{}` in {} {}",
+        get_metadata(&current_track).await.title,
+        channel_id.to_channel(ctx).await?.mention(),
+        if was_looping {
+            "deaktiviert"
+        } else {
+            "aktiviert"
+        }
+    );
+
+    _ = respond_success(&ctx, "Loop", response_details, false).await?;
 
     Ok(())
 }
@@ -278,54 +430,71 @@ pub async fn play(
     guild_only,
     description_localized("de", "Überspringt das aktuelle Lied")
 )]
-pub async fn skip(ctx: CommandContext<'_>) -> Result<(), Error> {
-    if !check_user_in_call(ctx).await {
-        _ = respond_err(&ctx, "Du bist nicht in einem Sprachkanal mit dem Bot").await?;
-        return Ok(());
-    }
+pub async fn skip(ctx: CommandContext<'_>) -> Result<(), CommandError> {
+    let (channel_id, call) = get_call(ctx).await?;
+    let call = call.lock().await;
 
-    let songbird = songbird::get(ctx.serenity_context()).await.unwrap();
-    let user_guild = ctx.guild().unwrap().id;
+    let queue = call.queue();
+    let skipped = queue.current().ok_or(QueueEmpty)?;
+    _ = queue.skip();
 
-    if let Some(call) = songbird.get(user_guild) {
-        let call = call.lock().await;
-        _ = call.queue().skip();
-        _ = respond_success(&ctx, "Loop", "Lied übersprungen", false).await?;
-    }
+    let response_details = format!(
+        "`{}` in Kanal {} übersprungen{}",
+        &get_metadata(&skipped).await.author,
+        channel_id.to_channel(ctx).await?.mention(),
+        match queue.current() {
+            Some(t) => format!("\n`{}` wird jetzt abgespielt", get_metadata(&t).await.title),
+            None => "".to_owned(),
+        }
+    );
+
+    _ = respond_success(&ctx, "Skipped", response_details, false).await?;
 
     Ok(())
 }
 
-/// Loops the current track until loop is deactivated again, or the track is skipped
+/// Stops playback and clears the queue
 #[poise::command(
-    rename = "loop",
     slash_command,
     guild_only,
-    description_localized("de", "Wiederholt das aktuelle Lied bis loop wieder deaktiviert oder es übersprungen wird"
-    )
+    description_localized("de", "Stoppt die aktive Wiedergabe und leert die Warteschlange")
 )]
-pub async fn loop_command(ctx: CommandContext<'_>) -> Result<(), Error> {
-    if !check_user_in_call(ctx).await {
-        _ = respond_err(&ctx, "Du bist nicht in einem Sprachkanal mit dem Bot").await?;
-        return Ok(());
-    }
+pub async fn stop(ctx: CommandContext<'_>) -> Result<(), CommandError> {
+    let (channel_id, call) = get_call(ctx).await?;
+    let call = call.lock().await;
 
-    let songbird = songbird::get(ctx.serenity_context()).await.unwrap();
-    let user_guild = ctx.guild().unwrap().id;
+    let queue = call.queue();
+    if queue.is_empty() {
+        return Err(QueueEmpty);
+    };
+    queue.stop();
 
-    if let Some(call) = songbird.get(user_guild) {
-        let call = call.lock().await;
-        let current_track = call.queue().current();
-        if let Some(current_track) = current_track {
-            if current_track.get_info().await.unwrap().loops == LoopState::Finite(0) {
-                _ = current_track.enable_loop();
-                _ = respond_success(&ctx, "Loop", "Wiederholung aktiviert", false).await?;
-            } else {
-                _ = current_track.disable_loop();
-                _ = respond_success(&ctx, "Loop", "Wiederholung deaktiviert", false).await?;
-            }
-        }
-    }
+    let response_details = format!(
+        "Wiedergabe in Kanal {} gestoppt und Warteliste geleert",
+        channel_id.to_channel(ctx).await?.mention()
+    );
+
+    _ = respond_success(&ctx, "Stopped", response_details, false).await?;
+
+    Ok(())
+}
+
+/// Leaves the current channel
+#[poise::command(
+    slash_command,
+    guild_only,
+    description_localized("de", "Verlässt den aktuellen Channel")
+)]
+pub async fn leave(ctx: CommandContext<'_>) -> Result<(), CommandError> {
+    let (channel_id, call) = get_call(ctx).await?;
+    let mut call = call.lock().await;
+
+    call.queue().stop();
+    call.stop();
+    call.leave().await.map_err(|_| LeaveVoice)?;
+
+    let response_details = format!("{} verlassen", channel_id.to_channel(ctx).await?.mention());
+    _ = respond_success(&ctx, "Left", response_details, false).await?;
 
     Ok(())
 }
