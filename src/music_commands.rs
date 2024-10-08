@@ -1,6 +1,6 @@
 use log::error;
 use poise::{CreateReply, ReplyHandle};
-use reqwest::Client as HttpClient;
+use reqwest::{Client as HttpClient, Url};
 use serenity::all::{ChannelId, GuildId};
 use serenity::builder::{AutocompleteChoice, CreateAllowedMentions, CreateEmbed};
 use serenity::futures::future::join_all;
@@ -47,6 +47,17 @@ async fn get_metadata(track: &TrackHandle) -> Arc<TrackMetadata> {
         .get::<TrackMetadataKey>()
         .expect("Every track is added with Metadata in the typemap")
         .clone()
+}
+
+fn get_yt_id_from_url(url: &str) -> Option<String> {
+    match Url::parse(url).ok() {
+        Some(url) if url.domain().is_some_and(|d| d == "youtu.be") => Some(url.path().to_owned()),
+        Some(url) if url.domain().is_some_and(|d| d.ends_with("youtube.com")) => url
+            .query_pairs()
+            .filter_map(|(k, v)| (k == "v").then_some((*v).to_owned()))
+            .next(),
+        _ => None,
+    }
 }
 
 // ======== Shared components ========
@@ -168,7 +179,7 @@ pub async fn help(ctx: CommandContext<'_>) -> Result<(), CommandError> {
 }
 
 async fn autocomplete_yt_search(ctx: CommandContext<'_>, partial: &str) -> Vec<AutocompleteChoice> {
-    if partial.len() < 3 || partial.starts_with("http") {
+    if partial.len() < 3 {
         // Discord doesn't like 0-length options
         return vec![AutocompleteChoice::new(
             "Tippe weiter, um Suchvorschläge zu erhalten",
@@ -179,6 +190,23 @@ async fn autocomplete_yt_search(ctx: CommandContext<'_>, partial: &str) -> Vec<A
     let http_client = get_http_client(ctx.serenity_context()).await;
     let yt_api_key = &ctx.data().yt_api_key;
 
+    // YouTube URL
+    if let Some(id) = get_yt_id_from_url(partial) {
+        return match yt_api::yt_video_details(&id, http_client, yt_api_key.as_deref()).await {
+            Ok(video) => vec![AutocompleteChoice::new(video.title, partial)],
+            Err(e) => {
+                error!("YT video lookup failed: {:?}", e);
+                vec![AutocompleteChoice::new(partial, partial)]
+            }
+        };
+    }
+
+    // Other URL (include ':' to allow searches that start with "http")
+    if partial.starts_with("https:") || partial.starts_with("http:") {
+        return vec![AutocompleteChoice::new(partial, partial)];
+    }
+
+    // Random text -> search
     match yt_api::yt_search(partial, 5, http_client, yt_api_key.as_deref()).await {
         Ok(results) => results
             .into_iter()
@@ -229,30 +257,43 @@ pub async fn play(
     // Make sure the bot is in the right channel
     let call = join_voice(songbird, user_guild, connect_to).await?;
 
-    // ======== Play song ========
+    // ======== Play track ========
 
     let http_client = get_http_client(ctx.serenity_context()).await;
-    let do_search = !source.starts_with("http");
+    let yt_api_key = &ctx.data().yt_api_key;
 
-    // yt-dlp lookup
-    let mut src = if do_search {
-        // This only available as a fallback for when autocomplete fails completely
-        YoutubeDl::new_search(http_client, source)
+    let url = Url::parse(&source).ok();
+    // Extract youtube video id from url
+    let youtube_id = url
+        .as_ref()
+        .and_then(|url| get_yt_id_from_url(url.as_ref()));
+
+    let mut track = if let Some(url) = url {
+        YoutubeDl::new(http_client.clone(), url.into())
     } else {
-        YoutubeDl::new(http_client, source)
+        // This only available as a fallback for when autocomplete fails completely
+        YoutubeDl::new_search(http_client.clone(), source)
     };
 
-    ctx.defer().await?;
+    //TODO: Handle metadata lookup errors
+    let metadata: Arc<TrackMetadata> = match youtube_id {
+        Some(video_id) => Arc::new(TrackMetadata::from_with_request(
+            yt_api::yt_video_details(&video_id, http_client, yt_api_key.as_deref())
+                .await
+                .unwrap(),
+            ctx.author().id,
+        )),
+        None => Arc::new(TrackMetadata::from_with_request(
+            track.aux_metadata().await.unwrap(),
+            ctx.author().id,
+        )),
+    };
 
-    // Play track
     let mut call = call.lock().await;
-
-    //TODO: Get aux_metadata from id after enqueuing (Lower latency)
-    let metadata: Arc<TrackMetadata> = Arc::new(TrackMetadata::from_with_request(
-        src.aux_metadata().await.unwrap(),
-        ctx.author().id,
-    ));
-    let track_handle = call.enqueue_input(src.into()).await;
+    let track_handle = call.enqueue_with_preload(
+        track.into(),
+        Some(metadata.duration - Duration::from_secs(5)),
+    );
 
     track_handle
         .typemap()
@@ -272,29 +313,19 @@ pub async fn play(
             });
         }
 
-        _ = respond_success(
-            &ctx,
-            "Track Found",
-            format!(
-                "`{}` wird jetzt in {} abgespielt",
-                metadata.title,
-                connect_to.to_channel(ctx).await?.mention()
-            ),
-            false,
-        )
-        .await?;
+        let response_details = format!(
+            "`{}` wird jetzt in {} abgespielt",
+            metadata.title,
+            connect_to.to_channel(ctx).await?.mention()
+        );
+        _ = respond_success(&ctx, "Track Found", response_details, false).await?;
     } else {
-        _ = respond_success(
-            &ctx,
-            "Track Found",
-            format!(
-                "`{}` zur Wartschlange für {} hinzugefügt",
-                metadata.title,
-                connect_to.to_channel(ctx).await?.mention()
-            ),
-            false,
-        )
-        .await?;
+        let response_details = format!(
+            "`{}` zur Wartschlange für {} hinzugefügt",
+            metadata.title,
+            connect_to.to_channel(ctx).await?.mention()
+        );
+        _ = respond_success(&ctx, "Track Found", response_details, false).await?;
     }
 
     Ok(())

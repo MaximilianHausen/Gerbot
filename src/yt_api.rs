@@ -77,7 +77,7 @@ pub enum YtThumbnailSize {
     Default,
     Medium,
     High,
-    Standart,
+    Standard,
     Maxres,
 }
 
@@ -134,10 +134,10 @@ pub struct YtVideoContentDetails {
     /// "true" or "false" (why not boolean?)
     caption: String,
     licensed_content: bool,
-    region_restriction: YtVideoRegionRestriction,
+    region_restriction: Option<YtVideoRegionRestriction>,
     // content_rating not here because it is a really complicated type
     projection: YtVideoProjection,
-    has_custom_thumbnail: bool,
+    // has_custom_thumbnail not here because it is only visible to the uploader
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -237,8 +237,10 @@ impl From<YtVideoModel> for YtVideo {
 pub enum YtApiError {
     #[error("Request error")]
     Request(#[from] reqwest::Error),
-    #[error("Api error")]
+    #[error("Youtube API error")]
     Api,
+    #[error("The provided video id does not exist")]
+    InvalidVideoId,
 }
 
 /// Low latency YouTube search request for videos
@@ -279,9 +281,15 @@ pub async fn yt_video_details(
 
     let response = http_client.get(url).send().await?;
 
-    process_api_response::<YtVideoModel>(response)
+    process_api_response::<YtListModel<YtVideoModel>>(response)
         .await
-        .map(|ok| ok.into())
+        .map(|list| {
+            list.items
+                .into_iter()
+                .next()
+                .map(|i| i.into())
+                .ok_or(YtApiError::InvalidVideoId)
+        })?
 }
 
 async fn try_clear_ratelimit() {
