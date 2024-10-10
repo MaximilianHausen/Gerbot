@@ -222,6 +222,7 @@ async fn handle_command_error(ctx: &CommandContext<'_>, error: CommandError) {
     match error {
         CommandError::Serenity(inner) => {
             error!("Serenity error: {}", inner);
+            respond_err(ctx, "Ein unerwarteter Fehler ist aufgetreten").await;
         }
         CommandError::JoinVoice(inner) => match inner {
             JoinVoiceError::Join(inner) => {

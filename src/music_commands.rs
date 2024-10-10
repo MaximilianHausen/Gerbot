@@ -275,16 +275,20 @@ pub async fn play(
         YoutubeDl::new_search(http_client.clone(), source)
     };
 
-    //TODO: Handle metadata lookup errors
     let metadata: Arc<TrackMetadata> = match youtube_id {
         Some(video_id) => Arc::new(TrackMetadata::from_with_request(
-            yt_api::yt_video_details(&video_id, http_client, yt_api_key.as_deref())
+            yt_api::yt_video_details(&video_id, http_client.clone(), yt_api_key.as_deref())
                 .await
-                .unwrap(),
+                .map(TrackMetadata::from)
+                .unwrap_or_default(),
             ctx.author().id,
         )),
         None => Arc::new(TrackMetadata::from_with_request(
-            track.aux_metadata().await.unwrap(),
+            track
+                .aux_metadata()
+                .await
+                .map(TrackMetadata::from)
+                .unwrap_or_default(),
             ctx.author().id,
         )),
     };
@@ -292,7 +296,7 @@ pub async fn play(
     let mut call = call.lock().await;
     let track_handle = call.enqueue_with_preload(
         track.into(),
-        Some(metadata.duration - Duration::from_secs(5)),
+        Some(metadata.duration.saturating_sub(Duration::from_secs(5))),
     );
 
     track_handle
