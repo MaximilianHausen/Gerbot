@@ -1,4 +1,5 @@
 use crate::music_commands::{GetCallError, JoinVoiceError};
+use crate::youtube::YoutubeClient;
 use log::{error, info, warn, LevelFilter};
 use poise::{CreateReply, FrameworkContext, FrameworkError};
 use reqwest::Client as HttpClient;
@@ -13,7 +14,7 @@ use thiserror::Error;
 mod metadata;
 mod music_commands;
 mod serde;
-mod yt_api;
+mod youtube;
 
 const SUCCESS_COLOUR: Colour = Colour::BLURPLE;
 const ERROR_COLOUR: Colour = Colour::RED;
@@ -57,10 +58,14 @@ impl TypeMapKey for HttpKey {
     type Value = HttpClient;
 }
 
-// Custom user data passed to all command functions
-pub struct GlobalData {
-    yt_api_key: Option<String>,
+struct YoutubeKey;
+
+impl TypeMapKey for YoutubeKey {
+    type Value = YoutubeClient;
 }
+
+// Custom user data passed to all command functions
+pub struct GlobalData {}
 
 #[tokio::main]
 async fn main() {
@@ -109,9 +114,7 @@ async fn main() {
         .setup(move |ctx, _ready, framework| {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
-                Ok(GlobalData {
-                    yt_api_key: std::env::var("YOUTUBE_API_KEY").ok(),
-                })
+                Ok(GlobalData {})
             })
         })
         .options(options)
@@ -123,6 +126,10 @@ async fn main() {
         .framework(framework)
         .register_songbird()
         .type_map_insert::<HttpKey>(HttpClient::new())
+        .type_map_insert::<YoutubeKey>(YoutubeClient::new(
+            HttpClient::new(),
+            std::env::var("YOUTUBE_API_KEY").ok(),
+        ))
         .await
         .expect("Error creating client");
 

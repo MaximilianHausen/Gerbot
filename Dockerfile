@@ -1,4 +1,4 @@
-FROM rust:1.80-alpine AS builder
+FROM rust:1.81-alpine AS builder
 RUN apk add --no-cache build-base cmake
 WORKDIR /source
 COPY . .

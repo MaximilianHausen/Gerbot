@@ -73,3 +73,38 @@ pub mod iso_duration {
         }
     }
 }
+
+pub mod bool_string {
+    use core::fmt;
+    use serde::de::Visitor;
+    use serde::{de, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: bool, serializer: S) -> Result<S::Ok, S::Error> {
+        let str = if v { "true" } else { "false" };
+        serializer.serialize_str(str)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+        deserializer.deserialize_str(BoolStringVisitor)
+    }
+
+    struct BoolStringVisitor;
+
+    impl<'de> Visitor<'de> for BoolStringVisitor {
+        type Value = bool;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            write!(formatter, "either 'true' or 'false'")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            if v == "true" {
+                Ok(true)
+            } else if v == "false" {
+                Ok(false)
+            } else {
+                Err(de::Error::custom("not a boolean string"))
+            }
+        }
+    }
+}

@@ -17,14 +17,22 @@ use tokio::sync::Mutex;
 
 use crate::metadata::{TrackMetadata, TrackMetadataKey};
 use crate::music_commands::GetCallError::{NotInCall, NotInGuild, SongbirdNotFound};
+use crate::youtube::{YoutubeClient, YtSearchFilter};
 use crate::CommandError::{LeaveVoice, QueueEmpty, UserNotInVoice};
-use crate::{yt_api, CommandContext, CommandError, SUCCESS_COLOUR};
+use crate::{CommandContext, CommandError, SUCCESS_COLOUR};
 
 // ======== Util functions ========
 
 async fn get_http_client(ctx: &serenity::client::Context) -> HttpClient {
     let data = ctx.data.read().await;
     data.get::<crate::HttpKey>()
+        .cloned()
+        .expect("Guaranteed to exist in the typemap")
+}
+
+async fn get_youtube_client(ctx: &serenity::client::Context) -> YoutubeClient {
+    let data = ctx.data.read().await;
+    data.get::<crate::YoutubeKey>()
         .cloned()
         .expect("Guaranteed to exist in the typemap")
 }
@@ -187,12 +195,11 @@ async fn autocomplete_yt_search(ctx: CommandContext<'_>, partial: &str) -> Vec<A
         )];
     }
 
-    let http_client = get_http_client(ctx.serenity_context()).await;
-    let yt_api_key = &ctx.data().yt_api_key;
+    let youtube_client = get_youtube_client(ctx.serenity_context()).await;
 
     // YouTube URL
     if let Some(id) = get_yt_id_from_url(partial) {
-        return match yt_api::yt_video_details(&id, http_client, yt_api_key.as_deref()).await {
+        return match youtube_client.get_video(&id).await {
             Ok(video) => vec![AutocompleteChoice::new(video.title, partial)],
             Err(e) => {
                 error!("YT video lookup failed: {:?}", e);
@@ -207,7 +214,10 @@ async fn autocomplete_yt_search(ctx: CommandContext<'_>, partial: &str) -> Vec<A
     }
 
     // Random text -> search
-    match yt_api::yt_search(partial, 5, http_client, yt_api_key.as_deref()).await {
+    match youtube_client
+        .search(partial, YtSearchFilter::Videos, 5)
+        .await
+    {
         Ok(results) => results
             .into_iter()
             .map(|video| AutocompleteChoice::new(&video.title, video.get_yt_url().as_str()))
@@ -220,7 +230,7 @@ async fn autocomplete_yt_search(ctx: CommandContext<'_>, partial: &str) -> Vec<A
 }
 
 //TODO: Help command text
-//Spielt ein Lied im momentanen Sprachkanal ab. Als Quelle geht ein Suchbegriff für Youtube oder ein direkter Link zu allen von yt-dlp unterstützten [Platformen](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md). Standartmäßig wird das Lied hinten in die Warteschlange eingereiht. Mit skip_queue true (TAB drücken nach Commandeingabe) wird es vorne eingereiht und sofort abgespielt (überspringt das momentane Lied)
+//Spielt ein Lied im momentanen Sprachkanal ab. Als Quelle geht ein Suchbegriff für Youtube oder ein direkter Link zu allen von yt-dlp unterstützten [Platformen](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md). Standardmäßig wird das Lied hinten in die Warteschlange eingereiht. Mit skip_queue true (TAB drücken nach Commandeingabe) wird es vorne eingereiht und sofort abgespielt (überspringt das momentane Lied)
 
 /// Plays a song in your current voice channel
 #[poise::command(
@@ -260,7 +270,7 @@ pub async fn play(
     // ======== Play track ========
 
     let http_client = get_http_client(ctx.serenity_context()).await;
-    let yt_api_key = &ctx.data().yt_api_key;
+    let youtube_client = get_youtube_client(ctx.serenity_context()).await;
 
     let url = Url::parse(&source).ok();
     // Extract youtube video id from url
@@ -277,7 +287,8 @@ pub async fn play(
 
     let metadata: Arc<TrackMetadata> = match youtube_id {
         Some(video_id) => Arc::new(TrackMetadata::from_with_request(
-            yt_api::yt_video_details(&video_id, http_client.clone(), yt_api_key.as_deref())
+            youtube_client
+                .get_video(&video_id)
                 .await
                 .map(TrackMetadata::from)
                 .unwrap_or_default(),
@@ -325,7 +336,7 @@ pub async fn play(
         _ = respond_success(&ctx, "Track Found", response_details, false).await?;
     } else {
         let response_details = format!(
-            "`{}` zur Wartschlange für {} hinzugefügt",
+            "`{}` zur Warteschlange für {} hinzugefügt",
             metadata.title,
             connect_to.to_channel(ctx).await?.mention()
         );
@@ -389,7 +400,7 @@ pub async fn now_playing(ctx: CommandContext<'_>) -> Result<(), CommandError> {
 #[poise::command(
     slash_command,
     guild_only,
-    description_localized("de", "Zeigt die aktuelle Wartschlange")
+    description_localized("de", "Zeigt die aktuelle Warteschlange")
 )]
 pub async fn queue(ctx: CommandContext<'_>) -> Result<(), CommandError> {
     let (_, call) = get_call(ctx).await?;

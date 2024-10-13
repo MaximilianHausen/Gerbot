@@ -1,4 +1,4 @@
-use crate::yt_api::YtVideo;
+use crate::youtube::YtVideo;
 use reqwest::Url;
 use serenity::all::UserId;
 use serenity::prelude::TypeMapKey;
@@ -57,7 +57,7 @@ impl From<YtVideo> for TrackMetadata {
             source_url: value.get_yt_url(), // This is first to make the borrow checker happy
             title: value.title,
             author: value.channel_title,
-            duration: value.duration.unwrap_or_default(),
+            duration: value.duration,
             requested_by: None,
         }
     }
