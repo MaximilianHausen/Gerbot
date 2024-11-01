@@ -59,7 +59,7 @@ async fn get_metadata(track: &TrackHandle) -> Arc<TrackMetadata> {
 
 fn get_yt_id_from_url(url: &str) -> Option<String> {
     match Url::parse(url).ok() {
-        Some(url) if url.domain().is_some_and(|d| d == "youtu.be") => Some(url.path().to_owned()),
+        Some(url) if url.domain().is_some_and(|d| d == "youtu.be") => Some(url.path()[1..].to_owned()),
         Some(url) if url.domain().is_some_and(|d| d.ends_with("youtube.com")) => url
             .query_pairs()
             .filter_map(|(k, v)| (k == "v").then_some((*v).to_owned()))
