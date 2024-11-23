@@ -1,5 +1,7 @@
 use log::error;
 use poise::{CreateReply, ReplyHandle};
+use rand::prelude::SliceRandom;
+use rand::thread_rng;
 use reqwest::{Client as HttpClient, Url};
 use serenity::all::{ChannelId, GuildId};
 use serenity::builder::{AutocompleteChoice, CreateAllowedMentions, CreateEmbed};
@@ -324,7 +326,7 @@ pub async fn play(
     )]
     #[autocomplete = "autocomplete_yt_video_search"]
     source: String,
-    #[description = "If the queue should be skipped"]
+    #[description = "Whether the queue should be skipped"]
     #[description_localized("de", "Ob die Warteschlange übersprungen werden soll")]
     skip_queue: Option<bool>,
 ) -> Result<(), CommandError> {
@@ -434,6 +436,12 @@ pub async fn playlist(
     #[description_localized("de", "Youtube-Suche oder Direktlink zu einer YouTube Playlist")]
     #[autocomplete = "autocomplete_yt_playlist_search"]
     source: String,
+    #[description = "Whether the tracks should be added in a randomized order"]
+    #[description_localized(
+        "de",
+        "Ob die Lieder in einer zufälligen Reihenfolge hinzugefügt werden sollen"
+    )]
+    shuffle: Option<bool>,
 ) -> Result<(), CommandError> {
     // ======== Join the right voice channel or return ========
 
@@ -468,7 +476,10 @@ pub async fn playlist(
         },
     };
 
-    let playlist = youtube_client.get_playlist(&playlist_id).await.unwrap();
+    let mut playlist = youtube_client.get_playlist(&playlist_id).await.unwrap();
+    if shuffle.is_some_and(|s| s) {
+        playlist.videos.shuffle(&mut thread_rng());
+    }
 
     call.lock().await.queue().stop();
 

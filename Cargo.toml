@@ -17,6 +17,7 @@ time = { version = "0.3", features = ["serde-well-known"] }
 thiserror = "2"
 
 tokio = { version = "1.39", features = ["macros", "rt-multi-thread"] }
+rand = "0.8"
 env_logger = "*"
 log = "*"
 
