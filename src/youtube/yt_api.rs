@@ -16,10 +16,12 @@ use tokio::try_join;
 pub(super) mod models {
     use reqwest::Url;
     use serde::Deserialize;
+    use serde_with::{serde_as, VecSkipError};
     use std::collections::HashMap;
     use std::time::Duration;
     use time::OffsetDateTime;
 
+    #[serde_as]
     #[derive(Clone, Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct YtList<T> {
@@ -27,6 +29,8 @@ pub(super) mod models {
         pub next_page_token: Option<String>,
         pub prev_page_token: Option<String>,
         pub page_info: YtListPageInfo,
+        #[serde_as(as = "VecSkipError<_>")]
+        #[serde(bound(deserialize = "T: Deserialize<'de>"))]
         pub items: Vec<T>,
     }
 
@@ -232,7 +236,7 @@ pub(super) mod models {
     #[serde(rename_all = "camelCase")]
     pub struct YtPlaylistItemContentDetails {
         pub video_id: String,
-        pub note: String,
+        pub note: Option<String>,
         #[serde(with = "time::serde::iso8601")]
         pub video_published_at: OffsetDateTime,
     }
@@ -365,7 +369,7 @@ impl YtApiClient {
             "https://www.googleapis.com/youtube/v3/playlists?part=snippet&id={id}&key={}",
             self.yt_api_key
         );
-        let items_url = format!("https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&playlistId={id}&key={}", self.yt_api_key);
+        let items_url = format!("https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&playlistId={id}&maxResults=50&key={}", self.yt_api_key);
 
         let meta_future = self.http_client.get(meta_url).send();
         let items_future = self.http_client.get(items_url).send();

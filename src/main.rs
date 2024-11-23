@@ -84,6 +84,7 @@ async fn main() {
         commands: vec![
             music_commands::help(),
             music_commands::play(),
+            music_commands::playlist(),
             music_commands::now_playing(),
             music_commands::queue(),
             music_commands::loop_command(),

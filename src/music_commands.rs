@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 
 use crate::metadata::{TrackMetadata, TrackMetadataKey};
 use crate::music_commands::GetCallError::{NotInCall, NotInGuild, SongbirdNotFound};
-use crate::youtube::{YoutubeClient, YtSearchFilter};
+use crate::youtube::{YoutubeClient, YtResourceId, YtSearchFilter};
 use crate::CommandError::{LeaveVoice, QueueEmpty, UserNotInVoice};
 use crate::{CommandContext, CommandError, SUCCESS_COLOUR};
 
@@ -57,14 +57,32 @@ async fn get_metadata(track: &TrackHandle) -> Arc<TrackMetadata> {
         .clone()
 }
 
-fn get_yt_id_from_url(url: &str) -> Option<String> {
+struct YtUrlIds {
+    video_id: Option<String>,
+    playlist_id: Option<String>,
+}
+
+fn get_yt_id_from_url(url: &str) -> YtUrlIds {
+    //TODO: Sanitize parsed yt ids
     match Url::parse(url).ok() {
-        Some(url) if url.domain().is_some_and(|d| d == "youtu.be") => Some(url.path()[1..].to_owned()),
-        Some(url) if url.domain().is_some_and(|d| d.ends_with("youtube.com")) => url
-            .query_pairs()
-            .filter_map(|(k, v)| (k == "v").then_some((*v).to_owned()))
-            .next(),
-        _ => None,
+        Some(url) if url.domain().is_some_and(|d| d == "youtu.be") => YtUrlIds {
+            video_id: Some(url.path()[1..].to_owned()),
+            playlist_id: None,
+        },
+        Some(url) if url.domain().is_some_and(|d| d.ends_with("youtube.com")) => YtUrlIds {
+            video_id: url
+                .query_pairs()
+                .filter_map(|(k, v)| (k == "v").then_some((*v).to_owned()))
+                .next(),
+            playlist_id: url
+                .query_pairs()
+                .filter_map(|(k, v)| (k == "list").then_some((*v).to_owned()))
+                .next(),
+        },
+        _ => YtUrlIds {
+            video_id: None,
+            playlist_id: None,
+        },
     }
 }
 
@@ -79,7 +97,7 @@ async fn respond_success<'a>(
     let embed = CreateEmbed::new()
         .title(title)
         .colour(SUCCESS_COLOUR)
-        .field("Details", details, false);
+        .description(details);
 
     ctx.send(
         CreateReply::default()
@@ -149,6 +167,61 @@ async fn get_call(ctx: CommandContext<'_>) -> Result<(ChannelId, Arc<Mutex<Call>
     Ok((user_channel, call))
 }
 
+async fn enqueue_track(
+    ctx: CommandContext<'_>,
+    call: Arc<Mutex<Call>>,
+    source: &str,
+) -> Result<Arc<TrackMetadata>, CommandError> {
+    let http_client = get_http_client(ctx.serenity_context()).await;
+    let youtube_client = get_youtube_client(ctx.serenity_context()).await;
+
+    let url = Url::parse(source).ok();
+    // Extract youtube video id from url
+    let youtube_id = url
+        .as_ref()
+        .and_then(|url| get_yt_id_from_url(url.as_ref()).video_id);
+
+    let mut track = if let Some(url) = url {
+        YoutubeDl::new(http_client.clone(), url.into())
+    } else {
+        // This only available as a fallback for when autocomplete fails completely
+        YoutubeDl::new_search(http_client.clone(), source.to_owned())
+    };
+
+    let metadata: Arc<TrackMetadata> = match youtube_id {
+        Some(video_id) => Arc::new(TrackMetadata::from_with_request(
+            youtube_client
+                .get_video(&video_id)
+                .await
+                .map(TrackMetadata::from)
+                .unwrap_or_default(),
+            ctx.author().id,
+        )),
+        None => Arc::new(TrackMetadata::from_with_request(
+            track
+                .aux_metadata()
+                .await
+                .map(TrackMetadata::from)
+                .unwrap_or_default(),
+            ctx.author().id,
+        )),
+    };
+
+    let mut call = call.lock().await;
+    let track_handle = call.enqueue_with_preload(
+        track.into(),
+        Some(metadata.duration.saturating_sub(Duration::from_secs(5))),
+    );
+
+    track_handle
+        .typemap()
+        .write()
+        .await
+        .insert::<TrackMetadataKey>(metadata.clone());
+
+    Ok(metadata)
+}
+
 // ======== Commands ========
 
 /// Infos about the available commands
@@ -186,7 +259,10 @@ pub async fn help(ctx: CommandContext<'_>) -> Result<(), CommandError> {
     Ok(())
 }
 
-async fn autocomplete_yt_search(ctx: CommandContext<'_>, partial: &str) -> Vec<AutocompleteChoice> {
+async fn autocomplete_yt_video_search(
+    ctx: CommandContext<'_>,
+    partial: &str,
+) -> Vec<AutocompleteChoice> {
     if partial.len() < 3 {
         // Discord doesn't like 0-length options
         return vec![AutocompleteChoice::new(
@@ -198,11 +274,11 @@ async fn autocomplete_yt_search(ctx: CommandContext<'_>, partial: &str) -> Vec<A
     let youtube_client = get_youtube_client(ctx.serenity_context()).await;
 
     // YouTube URL
-    if let Some(id) = get_yt_id_from_url(partial) {
+    if let Some(id) = get_yt_id_from_url(partial).video_id {
         return match youtube_client.get_video(&id).await {
             Ok(video) => vec![AutocompleteChoice::new(video.title, partial)],
             Err(e) => {
-                error!("YT video lookup failed: {:?}", e);
+                error!("YT video lookup for id {} failed: {:?}", id, e);
                 vec![AutocompleteChoice::new(partial, partial)]
             }
         };
@@ -241,12 +317,12 @@ async fn autocomplete_yt_search(ctx: CommandContext<'_>, partial: &str) -> Vec<A
 )]
 pub async fn play(
     ctx: CommandContext<'_>,
-    #[description = "Youtube search or direct link to all platforms supported by yt-dlp"]
+    #[description = "YouTube search or direct link to all platforms supported by yt-dlp"]
     #[description_localized(
         "de",
-        "Youtube-Suche oder Direktlink zu allen von yt-dlp unterstützten Platformen"
+        "YouTube-Suche oder Direktlink zu allen von yt-dlp unterstützten Platformen"
     )]
-    #[autocomplete = "autocomplete_yt_search"]
+    #[autocomplete = "autocomplete_yt_video_search"]
     source: String,
     #[description = "If the queue should be skipped"]
     #[description_localized("de", "Ob die Warteschlange übersprungen werden soll")]
@@ -269,55 +345,11 @@ pub async fn play(
 
     // ======== Play track ========
 
-    let http_client = get_http_client(ctx.serenity_context()).await;
-    let youtube_client = get_youtube_client(ctx.serenity_context()).await;
-
-    let url = Url::parse(&source).ok();
-    // Extract youtube video id from url
-    let youtube_id = url
-        .as_ref()
-        .and_then(|url| get_yt_id_from_url(url.as_ref()));
-
-    let mut track = if let Some(url) = url {
-        YoutubeDl::new(http_client.clone(), url.into())
-    } else {
-        // This only available as a fallback for when autocomplete fails completely
-        YoutubeDl::new_search(http_client.clone(), source)
-    };
-
-    let metadata: Arc<TrackMetadata> = match youtube_id {
-        Some(video_id) => Arc::new(TrackMetadata::from_with_request(
-            youtube_client
-                .get_video(&video_id)
-                .await
-                .map(TrackMetadata::from)
-                .unwrap_or_default(),
-            ctx.author().id,
-        )),
-        None => Arc::new(TrackMetadata::from_with_request(
-            track
-                .aux_metadata()
-                .await
-                .map(TrackMetadata::from)
-                .unwrap_or_default(),
-            ctx.author().id,
-        )),
-    };
-
-    let mut call = call.lock().await;
-    let track_handle = call.enqueue_with_preload(
-        track.into(),
-        Some(metadata.duration.saturating_sub(Duration::from_secs(5))),
-    );
-
-    track_handle
-        .typemap()
-        .write()
-        .await
-        .insert::<TrackMetadataKey>(metadata.clone());
+    let metadata = enqueue_track(ctx, call.clone(), &source).await?;
 
     // skip_queue -> Move to the front and skip current track
     if skip_queue.is_some_and(|v| v) {
+        let call = call.lock().await;
         let queue = call.queue();
 
         if queue.len() > 1 {
@@ -342,6 +374,115 @@ pub async fn play(
         );
         _ = respond_success(&ctx, "Track Found", response_details, false).await?;
     }
+
+    Ok(())
+}
+
+async fn autocomplete_yt_playlist_search(
+    ctx: CommandContext<'_>,
+    partial: &str,
+) -> Vec<AutocompleteChoice> {
+    if partial.len() < 3 {
+        // Discord doesn't like 0-length options
+        return vec![AutocompleteChoice::new(
+            "Tippe weiter, um Suchvorschläge zu erhalten",
+            partial,
+        )];
+    }
+
+    let youtube_client = get_youtube_client(ctx.serenity_context()).await;
+
+    // YouTube URL
+    if let Some(id) = get_yt_id_from_url(partial).playlist_id {
+        return match youtube_client.get_playlist(&id).await {
+            Ok(video) => vec![AutocompleteChoice::new(video.title, partial)],
+            Err(e) => {
+                error!("YT playlist lookup for id {} failed: {:?}", id, e);
+                vec![AutocompleteChoice::new(partial, partial)]
+            }
+        };
+    }
+
+    // Random text -> search
+    match youtube_client
+        .search(partial, YtSearchFilter::Playlists, 5)
+        .await
+    {
+        Ok(results) => results
+            .into_iter()
+            .map(|playlist| {
+                AutocompleteChoice::new(&playlist.title, playlist.get_yt_url().as_str())
+            })
+            .collect(),
+        Err(e) => {
+            error!("YT search failed: {:?}", e);
+            vec![AutocompleteChoice::new(partial, partial)]
+        }
+    }
+}
+
+/// Loads a whole YouTube playlist into the queue
+#[poise::command(
+    slash_command,
+    guild_only,
+    description_localized("de", "Lädt eine ganze Youtube-Playlist in die Warteschlange"),
+    required_bot_permissions = "VIEW_CHANNEL | CONNECT | SPEAK"
+)]
+pub async fn playlist(
+    ctx: CommandContext<'_>,
+    #[description = "YouTube search or direct link to a YouTube playlist"]
+    #[description_localized("de", "Youtube-Suche oder Direktlink zu einer YouTube Playlist")]
+    #[autocomplete = "autocomplete_yt_playlist_search"]
+    source: String,
+) -> Result<(), CommandError> {
+    // ======== Join the right voice channel or return ========
+
+    // Get user's current voice channel
+    let (user_guild, user_channel) = get_author_voice_state(ctx);
+
+    // Return if user not in a voice channel
+    let connect_to = user_channel.ok_or(UserNotInVoice)?;
+
+    let songbird = songbird::get(ctx.serenity_context())
+        .await
+        .ok_or(SongbirdNotFound)?;
+
+    // Make sure the bot is in the right channel
+    let call = join_voice(songbird, user_guild, connect_to).await?;
+
+    // ======== Play track ========
+
+    let youtube_client = get_youtube_client(ctx.serenity_context()).await;
+
+    // Get playlist id
+    let playlist_id = match get_yt_id_from_url(&source).playlist_id {
+        Some(id) => id,
+        None => match youtube_client
+            .search(&source, YtSearchFilter::Playlists, 1)
+            .await
+            .ok()
+            .and_then(|mut vec| vec.pop().map(|r| r.id))
+        {
+            Some(YtResourceId::Playlist(id)) => id,
+            _ => panic!(),
+        },
+    };
+
+    let playlist = youtube_client.get_playlist(&playlist_id).await.unwrap();
+
+    call.lock().await.queue().stop();
+
+    //TODO: Send playlist requests in chunks
+    for video in playlist.videos {
+        enqueue_track(ctx, call.clone(), video.get_yt_url().as_str()).await?;
+    }
+
+    let response_details = format!(
+        "`{}` wird jetzt in {} abgespielt",
+        playlist.title,
+        connect_to.to_channel(ctx).await?.mention()
+    );
+    _ = respond_success(&ctx, "Track Found", response_details, false).await?;
 
     Ok(())
 }
