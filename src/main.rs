@@ -73,7 +73,7 @@ async fn main() {
         env_logger::init();
     } else {
         env_logger::Builder::new()
-            .filter(Some("gerbot"), LevelFilter::Info)
+            .filter(Some("gerbot"), LevelFilter::Debug)
             .init();
     }
 

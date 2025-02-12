@@ -16,12 +16,10 @@ use tokio::try_join;
 pub(super) mod models {
     use reqwest::Url;
     use serde::Deserialize;
-    use serde_with::{serde_as, VecSkipError};
     use std::collections::HashMap;
     use std::time::Duration;
     use time::OffsetDateTime;
 
-    #[serde_as]
     #[derive(Clone, Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct YtList<T> {
@@ -29,8 +27,6 @@ pub(super) mod models {
         pub next_page_token: Option<String>,
         pub prev_page_token: Option<String>,
         pub page_info: YtListPageInfo,
-        #[serde_as(as = "VecSkipError<_>")]
-        #[serde(bound(deserialize = "T: Deserialize<'de>"))]
         pub items: Vec<T>,
     }
 
@@ -161,8 +157,8 @@ pub(super) mod models {
     #[derive(Clone, Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct YtVideoRegionRestriction {
-        pub allowed: Vec<String>,
-        pub blocked: Vec<String>,
+        pub allowed: Option<Vec<String>>,
+        pub blocked: Option<Vec<String>>,
     }
 
     #[derive(Clone, Debug, Deserialize)]
@@ -428,7 +424,7 @@ impl YtApiClient {
                 //TODO: Parse yt api errors for more appropriate handling
                 *self.rate_limited_day.write().await =
                     Some(OffsetDateTime::now_utc().date().to_julian_day());
-                info!("Encountered rate limit from YouTube API. Switching to fallback proxy");
+                info!("Encountered rate limit from YouTube API. Disabling for the day.");
                 Err(YtApiError::QuotaExceeded)
             }
             _ => Err(YtApiError::Api),

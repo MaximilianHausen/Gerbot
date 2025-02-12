@@ -5,6 +5,7 @@ use reqwest::{Client as HttpClient, Url};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use log::debug;
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -159,6 +160,7 @@ impl YoutubeClient {
         filter: YtSearchFilter,
         n_results: u8,
     ) -> Result<Vec<YtResource>, YtApiError> {
+        debug!("Youtube search: {query}");
         match &self.yt_api_client {
             Some(yt_api_client) if !yt_api_client.is_ratelimited().await => {
                 yt_api_client.search(query, filter, n_results).await
@@ -171,6 +173,7 @@ impl YoutubeClient {
     }
 
     pub async fn get_video(&self, id: &str) -> Result<YtVideo, YtApiError> {
+        debug!("Youtube video by id: {id}");
         match &self.yt_api_client {
             Some(yt_api_client) if !yt_api_client.is_ratelimited().await => {
                 yt_api_client.get_video(id).await
@@ -183,6 +186,7 @@ impl YoutubeClient {
     }
 
     pub async fn get_playlist(&self, id: &str) -> Result<YtPlaylist, YtApiError> {
+        debug!("Youtube playlist by id: {id}");
         match &self.yt_api_client {
             Some(yt_api_client) if !yt_api_client.is_ratelimited().await => {
                 yt_api_client.get_playlist(id).await

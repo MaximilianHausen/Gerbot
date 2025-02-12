@@ -32,7 +32,7 @@ pub mod iso_duration {
 
     struct ISODurationVisitor;
 
-    impl<'de> Visitor<'de> for ISODurationVisitor {
+    impl Visitor<'_> for ISODurationVisitor {
         type Value = Duration;
 
         fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -90,7 +90,7 @@ pub mod bool_string {
 
     struct BoolStringVisitor;
 
-    impl<'de> Visitor<'de> for BoolStringVisitor {
+    impl Visitor<'_> for BoolStringVisitor {
         type Value = bool;
 
         fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {

@@ -1,7 +1,6 @@
 use log::error;
 use poise::{CreateReply, ReplyHandle};
 use rand::prelude::SliceRandom;
-use rand::thread_rng;
 use reqwest::{Client as HttpClient, Url};
 use serenity::all::{ChannelId, GuildId};
 use serenity::builder::{AutocompleteChoice, CreateAllowedMentions, CreateEmbed};
@@ -190,7 +189,7 @@ async fn enqueue_track(
         YoutubeDl::new_search(http_client.clone(), source.to_owned())
     };
 
-    let metadata: Arc<TrackMetadata> = match youtube_id {
+    let metadata = match youtube_id {
         Some(video_id) => Arc::new(TrackMetadata::from_with_request(
             youtube_client
                 .get_video(&video_id)
@@ -478,7 +477,7 @@ pub async fn playlist(
 
     let mut playlist = youtube_client.get_playlist(&playlist_id).await.unwrap();
     if shuffle.is_some_and(|s| s) {
-        playlist.videos.shuffle(&mut thread_rng());
+        playlist.videos.shuffle(&mut rand::rng());
     }
 
     call.lock().await.queue().stop();

@@ -11,13 +11,12 @@ songbird = { version = "0.4.5", features = ["builtin-queue"] }
 # reqwest 0.11 required for songbird
 reqwest = { version = "0.11", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
-serde_with = "3"
 
 time = { version = "0.3", features = ["serde-well-known"] }
 thiserror = "2"
 
 tokio = { version = "1.39", features = ["macros", "rt-multi-thread"] }
-rand = "0.8"
+rand = "0.9.0"
 env_logger = "*"
 log = "*"
 
