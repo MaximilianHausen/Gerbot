@@ -8,7 +8,7 @@ use serenity::futures::future::join_all;
 use serenity::prelude::Mentionable;
 use songbird::error::JoinError;
 use songbird::input::{Compose, YoutubeDl};
-use songbird::tracks::{LoopState, TrackHandle};
+use songbird::tracks::{LoopState, Track};
 use songbird::{Call, Songbird};
 use std::ops::Deref;
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::metadata::{TrackMetadata, TrackMetadataKey};
+use crate::metadata::TrackMetadata;
 use crate::music_commands::GetCallError::{NotInCall, NotInGuild, SongbirdNotFound};
 use crate::youtube::{YoutubeClient, YtResourceId, YtSearchFilter};
 use crate::CommandError::{LeaveVoice, QueueEmpty, UserNotInVoice};
@@ -46,16 +46,6 @@ fn get_author_voice_state(ctx: CommandContext<'_>) -> (GuildId, Option<ChannelId
         .and_then(|voice_state| voice_state.channel_id);
 
     (guild.id, channel_id)
-}
-
-async fn get_metadata(track: &TrackHandle) -> Arc<TrackMetadata> {
-    track
-        .typemap()
-        .read()
-        .await
-        .get::<TrackMetadataKey>()
-        .expect("Every track is added with Metadata in the typemap")
-        .clone()
 }
 
 struct YtUrlIds {
@@ -183,7 +173,7 @@ async fn enqueue_track(
         .and_then(|url| get_yt_id_from_url(url.as_ref()).video_id);
 
     let mut track = if let Some(url) = url {
-        YoutubeDl::new(http_client.clone(), url.into())
+        YoutubeDl::new(http_client.clone(), url.to_string())
     } else {
         // This only available as a fallback for when autocomplete fails completely
         YoutubeDl::new_search(http_client.clone(), source.to_owned())
@@ -209,16 +199,10 @@ async fn enqueue_track(
     };
 
     let mut call = call.lock().await;
-    let track_handle = call.enqueue_with_preload(
-        track.into(),
+    call.enqueue_with_preload(
+        Track::new_with_data(track.into(), metadata.clone()),
         Some(metadata.duration.saturating_sub(Duration::from_secs(5))),
     );
-
-    track_handle
-        .typemap()
-        .write()
-        .await
-        .insert::<TrackMetadataKey>(metadata.clone());
 
     Ok(metadata)
 }
@@ -509,7 +493,7 @@ pub async fn now_playing(ctx: CommandContext<'_>) -> Result<(), CommandError> {
 
     let queue = call.queue();
     let track = queue.current().ok_or(QueueEmpty)?;
-    let metadata = get_metadata(&track).await;
+    let metadata = track.data::<TrackMetadata>();
     let playback_info = track.get_info().await.unwrap();
 
     fn format_duration(duration: Duration) -> String {
@@ -565,7 +549,7 @@ pub async fn queue(ctx: CommandContext<'_>) -> Result<(), CommandError> {
 
     let track_list = join_all(queue.current_queue().into_iter().enumerate().map(
         |(i, t)| async move {
-            let meta = get_metadata(&t).await;
+            let meta = t.data::<TrackMetadata>();
             let icon = if t.get_info().await.unwrap().loops != LoopState::Finite(0) {
                 ":repeat:"
             } else {
@@ -607,7 +591,7 @@ pub async fn loop_command(ctx: CommandContext<'_>) -> Result<(), CommandError> {
 
     let response_details = format!(
         "Wiederholung für `{}` in {} {}",
-        get_metadata(&current_track).await.title,
+        current_track.data::<TrackMetadata>().title,
         channel_id.to_channel(ctx).await?.mention(),
         if was_looping {
             "deaktiviert"
@@ -637,10 +621,13 @@ pub async fn skip(ctx: CommandContext<'_>) -> Result<(), CommandError> {
 
     let response_details = format!(
         "`{}` in Kanal {} übersprungen{}",
-        &get_metadata(&skipped).await.author,
+        &skipped.data::<TrackMetadata>().author,
         channel_id.to_channel(ctx).await?.mention(),
         match queue.current() {
-            Some(t) => format!("\n`{}` wird jetzt abgespielt", get_metadata(&t).await.title),
+            Some(t) => format!(
+                "\n`{}` wird jetzt abgespielt",
+                t.data::<TrackMetadata>().title
+            ),
             None => "".to_owned(),
         }
     );

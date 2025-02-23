@@ -1,9 +1,7 @@
 use crate::youtube::YtVideo;
 use reqwest::Url;
 use serenity::all::UserId;
-use serenity::prelude::TypeMapKey;
 use songbird::input::AuxMetadata;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Minimal metadata required by the music commands
@@ -61,11 +59,4 @@ impl From<YtVideo> for TrackMetadata {
             requested_by: None,
         }
     }
-}
-
-/// Key type for using TrackMetadata in a TypeMap
-pub struct TrackMetadataKey;
-
-impl TypeMapKey for TrackMetadataKey {
-    type Value = Arc<TrackMetadata>;
 }

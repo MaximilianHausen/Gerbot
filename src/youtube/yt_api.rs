@@ -116,6 +116,7 @@ pub(super) mod models {
         pub description: String,
         pub thumbnails: HashMap<YtThumbnailSize, YtThumbnailInfo>,
         pub channel_title: String,
+        #[serde(default)]
         pub tags: Vec<String>,
         pub category_id: String,
         pub live_broadcast_content: YtLiveBroadcastContent,
@@ -157,8 +158,10 @@ pub(super) mod models {
     #[derive(Clone, Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct YtVideoRegionRestriction {
-        pub allowed: Option<Vec<String>>,
-        pub blocked: Option<Vec<String>>,
+        #[serde(default)]
+        pub allowed: Vec<String>,
+        #[serde(default)]
+        pub blocked: Vec<String>,
     }
 
     #[derive(Clone, Debug, Deserialize)]
